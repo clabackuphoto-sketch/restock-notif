@@ -1,41 +1,195 @@
-name: KIKO restock monitor
+"""
+KIKO x Stabilo Lip Mark(er) restock monitor -> Discord notification.
 
-on:
-  schedule:
-    - cron: "*/15 * * * *"  # tiap 15 menit (GitHub bisa telat beberapa menit)
-  workflow_dispatch:         # tombol "Run workflow" manual
+  python kiko_monitor.py                 # normal run (used by GitHub Actions)
+  python kiko_monitor.py --debug         # print every button found + save screenshots, no notify
+  python kiko_monitor.py --test-discord  # send a test message to Discord
+"""
+import json
+import os
+import re
+import sys
+import urllib.request
+from pathlib import Path
 
-permissions:
-  contents: read
+from playwright.sync_api import sync_playwright
 
-concurrency:
-  group: kiko-monitor
-  cancel-in-progress: false
+# ---- Edit this list to add/remove things to watch -------------------------
+# Only ONE page is checked per run: KIKO's anti-bot blocks the 2nd page in a row.
+# Runs alternate between these (UK, then FR, then UK ...). Shade 01 of each
+# country is used as the signal; the restock alert links all 4 pages.
+PRODUCTS = [
+    {
+        "name": "Lip Marker 01 Fine Print (UK)",
+        "url": "https://www.kikocosmetics.com/en-gb/p/stabilo-x-kiko-lip-marker-01-58749/",
+        "locale": "en-GB",
+    },
+    {
+        "name": "Lip Marker 01 Fine Print (FR)",
+        "url": "https://www.kikocosmetics.com/fr-fr/p/stabilo-x-kiko-lip-marker-01-58749/",
+        "locale": "fr-FR",
+    },
+]
 
-jobs:
-  check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 8
-    steps:
-      - uses: actions/checkout@v4
+# All pages to check yourself when a restock alert arrives.
+ALL_LINKS = [
+    ("UK 01 Fine Print", "https://www.kikocosmetics.com/en-gb/p/stabilo-x-kiko-lip-marker-01-58749/"),
+    ("UK 04 On My Radar", "https://www.kikocosmetics.com/en-gb/p/stabilo-x-kiko-lip-marker-04-58755/"),
+    ("FR 01 Fine Print", "https://www.kikocosmetics.com/fr-fr/p/stabilo-x-kiko-lip-marker-01-58749/"),
+    ("FR 04", "https://www.kikocosmetics.com/fr-fr/p/stabilo-x-kiko-lip-marker-04-58755/"),
+]
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+# Text that shows up on KIKO's anti-bot block page (lowercase).
+BLOCK_MARKERS = [
+    "anomaly detected",
+    "think that you are a bot",
+    "solve this captcha",
+]
 
-      - name: Install Playwright + Chromium
-        run: |
-          pip install playwright
-          playwright install --with-deps chromium
+# Button texts (lowercase regex). "Notify me" / "Me prévenir" confirmed as sold-out labels.
+OUT_PATTERNS = [
+    r"notify me",
+    r"me pr[ée]venir",
+    r"sold out",
+    r"out of stock",
+    r"[ée]puis[ée]",
+    r"rupture",
+]
+IN_PATTERNS = [
+    r"add to (bag|cart|basket)",
+    r"ajouter au (panier|sac)",
+    r"ajouter à mon (panier|sac)",
+]
+# ---------------------------------------------------------------------------
 
-      # Simpan status terakhir antar-run supaya notif nggak dikirim berulang
-      - uses: actions/cache@v4
-        with:
-          path: state
-          key: kiko-state-${{ github.run_id }}
-          restore-keys: kiko-state-
+STATE_FILE = Path("state/state.json")
+WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 
-      - name: Check stock
-        run: python kiko_monitor.py
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+def notify(message: str) -> None:
+    print(f"[notify] {message}")
+    if not WEBHOOK:
+        print("  (DISCORD_WEBHOOK_URL not set, skipping Discord)")
+        return
+    data = json.dumps({"content": message}).encode()
+    req = urllib.request.Request(
+        WEBHOOK,
+        data=data,
+        headers={"Content-Type": "application/json", "User-Agent": "kiko-monitor/1.0"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=20).read()
+    except Exception as e:  # don't crash the whole run over a notif failure
+        print(f"  Discord send failed: {e}")
+
+
+def classify(texts):
+    """First button (in page order) that matches an OUT or IN label decides."""
+    for raw in texts:
+        t = " ".join(raw.split()).lower()
+        if not t:
+            continue
+        if any(re.search(p, t) for p in OUT_PATTERNS):
+            return "out", t
+        if any(re.search(p, t) for p in IN_PATTERNS):
+            return "in", t
+    return "unknown", None
+
+
+def check(browser, product, debug=False, idx=0):
+    ctx = browser.new_context(
+        locale=product["locale"],
+        viewport={"width": 1366, "height": 900},
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+    )
+    page = ctx.new_page()
+    try:
+        page.goto(product["url"], wait_until="domcontentloaded", timeout=45000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=20000)
+        except Exception:
+            pass
+        page.wait_for_timeout(3000)  # let the stock button render
+        body = page.content().lower()
+        if any(m in body for m in BLOCK_MARKERS):
+            if debug:
+                print(f"\n== {product['name']}\n  BLOCKED by anti-bot page")
+                page.screenshot(path=f"debug_{idx}.png", full_page=False)
+            return "blocked", None
+        texts = page.locator("button, a[role=button]").all_inner_texts()
+        if debug:
+            print(f"\n== {product['name']}")
+            for t in texts:
+                t = " ".join(t.split())
+                if t:
+                    print("  button:", t)
+            page.screenshot(path=f"debug_{idx}.png", full_page=False)
+        return classify(texts)
+    except Exception as e:
+        print(f"  error on {product['name']}: {e}")
+        return "unknown", None
+    finally:
+        ctx.close()
+
+
+def main():
+    if "--test-discord" in sys.argv:
+        notify("✅ Tes notif dari KIKO restock monitor. Kalau ini muncul, setup Discord sudah benar.")
+        return
+
+    debug = "--debug" in sys.argv
+    state = {}
+    if STATE_FILE.exists():
+        try:
+            state = json.loads(STATE_FILE.read_text())
+        except Exception:
+            state = {}
+
+    # Pick one product per run, rotating through PRODUCTS.
+    try:
+        i = int(state.get("_next", 0)) % len(PRODUCTS)
+    except (TypeError, ValueError):
+        i = 0
+    prod = PRODUCTS[i]
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        status, label = check(browser, prod, debug=debug, idx=i)
+        browser.close()
+
+    prev = state.get(prod["url"])
+    print(f"{prod['name']}: {status} (button: {label}) [before: {prev}]")
+
+    if not debug:
+        if status == "in" and prev != "in":
+            links = "\n".join(f"- {n}: {u}" for n, u in ALL_LINKS)
+            notify(
+                f"@everyone 🟢 **RESTOCK!** {prod['name']} sudah ada.\n"
+                f"Cek semua shade/negara sekarang:\n{links}"
+            )
+        elif status == "out" and prev == "in":
+            notify(f"🔴 {prod['name']} habis lagi.")
+        elif status == "blocked" and prev != "blocked":
+            notify(
+                f"🚫 KIKO memblokir skrip (halaman anti-bot) di {prod['name']}. "
+                f"Pengecekan halaman ini tidak jalan sampai blokir hilang. "
+                f"Pakai 'Notify me' resmi KIKO sebagai cadangan."
+            )
+        elif status == "unknown" and prev != "unknown":
+            notify(
+                f"⚠️ Skrip nggak bisa baca status {prod['name']} "
+                f"(halaman berubah / URL salah?). Cek manual: {prod['url']}"
+            )
+        state[prod["url"]] = status
+        state["_next"] = (i + 1) % len(PRODUCTS)
+
+    if not debug:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+if __name__ == "__main__":
+    main()
