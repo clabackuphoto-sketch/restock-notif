@@ -12,7 +12,9 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -63,6 +65,10 @@ IN_PATTERNS = [
     r"ajouter au (panier|sac)",
     r"ajouter à mon (panier|sac)",
 ]
+# Status summary to Discord (no @everyone). Runs are ~15 min apart and often
+# late, so "55 minutes since the last summary" gives roughly one per hour.
+SUMMARY_EVERY_MIN = 55
+WIB = timezone(timedelta(hours=7))
 # ---------------------------------------------------------------------------
 
 STATE_FILE = Path("state/state.json")
@@ -167,6 +173,31 @@ def check_listing(browser, listing, debug=False):
         ctx.close()
 
 
+STATUS_TEXT = {"out": "habis", "in": "🟢 ADA", "unknown": "❓ tidak terbaca"}
+
+
+def summary(state, now):
+    """Hourly status message built from the last known state of every shade."""
+    lines = [f"📋 Update {datetime.fromtimestamp(now, WIB):%H:%M} WIB, monitor masih jalan."]
+    for l in LISTINGS:
+        c = l["country"]
+        checked = state.get(f"checked:{c}")
+        when = (
+            f"cek terakhir {datetime.fromtimestamp(float(checked), WIB):%H:%M}"
+            if checked else "belum pernah dicek"
+        )
+        page = state.get(f"page:{c}")
+        if page and page != "ok":
+            lines.append(f"{c}: 🚫 halaman {'diblokir' if page == 'blocked' else 'gagal dibuka'} ({when})")
+            continue
+        shades = " · ".join(
+            f"{label.split()[0]} {STATUS_TEXT.get(state.get(f'{c} {slug}'), '-')}"
+            for label, slug in SHADES
+        )
+        lines.append(f"{c}: {shades} ({when})")
+    return "\n".join(lines)
+
+
 def main():
     if "--test-discord" in sys.argv:
         notify("✅ Tes notif dari KIKO restock monitor. Kalau ini muncul, setup Discord sudah benar.")
@@ -237,8 +268,17 @@ def main():
             state[key] = status
 
     if not debug:
+        now = time.time()
         state[page_key] = page_status
+        state[f"checked:{country}"] = now
         state["_next"] = (i + 1) % len(LISTINGS)
+        try:
+            last = float(state.get("_last_summary", 0))
+        except (TypeError, ValueError):
+            last = 0
+        if now - last >= SUMMARY_EVERY_MIN * 60:
+            notify(summary(state, now))
+            state["_last_summary"] = now
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         STATE_FILE.write_text(json.dumps(state, indent=2))
 
