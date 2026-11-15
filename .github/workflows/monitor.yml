@@ -1,0 +1,41 @@
+name: KIKO restock monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"  # tiap 15 menit (GitHub bisa telat beberapa menit)
+  workflow_dispatch:         # tombol "Run workflow" manual
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kiko-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright + Chromium
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      # Simpan status terakhir antar-run supaya notif nggak dikirim berulang
+      - uses: actions/cache@v4
+        with:
+          path: state
+          key: kiko-state-${{ github.run_id }}
+          restore-keys: kiko-state-
+
+      - name: Check stock
+        run: python kiko_monitor.py
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
